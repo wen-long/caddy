@@ -344,19 +344,14 @@ func replaceLocalAdminServer(cfg *Config) error {
 	// (old) admin endpoint since it will be different
 	// when the function returns
 	oldAdminServer := localAdminServer
-	defer func() {
-		// do the shutdown asynchronously so that any
-		// current API request gets a response; this
-		// goroutine may last a few seconds
-		if oldAdminServer != nil {
-			go func(oldAdminServer *http.Server) {
-				err := stopAdminServer(oldAdminServer)
-				if err != nil {
-					Log().Named("admin").Error("stopping current admin endpoint", zap.Error(err))
-				}
-			}(oldAdminServer)
-		}
-	}()
+	if oldAdminServer != nil {
+		go func(oldAdminServer *http.Server) {
+			err := stopAdminServer(oldAdminServer)
+			if err != nil {
+				Log().Named("admin").Error("stopping current admin endpoint", zap.Error(err))
+			}
+		}(oldAdminServer)
+	}
 
 	// set a default if admin wasn't otherwise configured
 	if cfg.Admin == nil {

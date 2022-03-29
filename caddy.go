@@ -278,12 +278,6 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
 	}
 
-	// run the new config and start all its apps
-	err = run(newCfg, true)
-	if err != nil {
-		return err
-	}
-
 	// swap old config with the new one
 	oldCfg := currentCfg
 	currentCfg = newCfg
@@ -314,6 +308,12 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 					zap.Error(err))
 			}
 		}
+	}
+
+	// run the new config and start all its apps
+	err = run(newCfg, true)
+	if err != nil {
+		return err
 	}
 
 	return nil

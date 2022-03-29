@@ -41,24 +41,7 @@ import (
 // the socket have been finished. Always be sure to close listeners
 // when you are done with them, just like normal listeners.
 func Listen(network, addr string) (net.Listener, error) {
-	lnKey := network + "/" + addr
-
-	sharedLn, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
-		ln, err := net.Listen(network, addr)
-		if err != nil {
-			// https://github.com/caddyserver/caddy/pull/4534
-			if isUnixNetwork(network) && isListenBindAddressAlreadyInUseError(err) {
-				return nil, fmt.Errorf("%w: this can happen if Caddy was forcefully killed", err)
-			}
-			return nil, err
-		}
-		return &sharedListener{Listener: ln, key: lnKey}, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &fakeCloseListener{sharedListener: sharedLn.(*sharedListener)}, nil
+	return net.Listen(network, addr)
 }
 
 // ListenPacket returns a net.PacketConn suitable for use in a Caddy module.
