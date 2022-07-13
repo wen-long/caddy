@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -242,29 +243,83 @@ func (h *HTTPTransport) NewTransport(ctx caddy.Context) (*http.Transport, error)
 	return rt, nil
 }
 
+// replaceTLSServername checks TLS servername to see if it needs replacing
+// if it does need replacing, it creates a new cloned HTTPTransport object to avoid any races
+// and does the replacing of the TLS servername on that and returns the new object
+// if no replacement is necessary it returns the original
+func (h *HTTPTransport) replaceTLSServername(repl *caddy.Replacer) *HTTPTransport {
+	// check whether we have TLS and need to replace the servername in the TLSClientConfig
+	if h.TLSEnabled() && strings.Contains(h.TLS.ServerName, "{") {
+		// make a new h, "copy" the parts we don't need to touch, add a new *tls.Config and replace servername
+		newtransport := &HTTPTransport{
+			Resolver:              h.Resolver,
+			TLS:                   h.TLS,
+			KeepAlive:             h.KeepAlive,
+			Compression:           h.Compression,
+			MaxConnsPerHost:       h.MaxConnsPerHost,
+			DialTimeout:           h.DialTimeout,
+			FallbackDelay:         h.FallbackDelay,
+			ResponseHeaderTimeout: h.ResponseHeaderTimeout,
+			ExpectContinueTimeout: h.ExpectContinueTimeout,
+			MaxResponseHeaderSize: h.MaxResponseHeaderSize,
+			WriteBufferSize:       h.WriteBufferSize,
+			ReadBufferSize:        h.ReadBufferSize,
+			Versions:              h.Versions,
+			Transport:             h.Transport.Clone(),
+			h2cTransport:          h.h2cTransport,
+		}
+		newtransport.Transport.TLSClientConfig.ServerName = repl.ReplaceAll(newtransport.Transport.TLSClientConfig.ServerName, "")
+		return newtransport
+	}
+
+	return h
+}
+
 // RoundTrip implements http.RoundTripper.
 func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	h.SetScheme(req)
+	// Try to replace TLS servername if needed
+	repl := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	transport := h.replaceTLSServername(repl)
+
+	transport.setScheme(req)
 
 	// if H2C ("HTTP/2 over cleartext") is enabled and the upstream request is
-	// HTTP/2 without TLS, use the alternate H2C-capable transport instead
-	if req.ProtoMajor == 2 && req.URL.Scheme == "http" && h.h2cTransport != nil {
+	// HTTP without TLS, use the alternate H2C-capable transport instead
+	if req.URL.Scheme == "http" && h.h2cTransport != nil {
 		return h.h2cTransport.RoundTrip(req)
 	}
 
-	return h.Transport.RoundTrip(req)
+	return transport.Transport.RoundTrip(req)
 }
 
-// SetScheme ensures that the outbound request req
+// setScheme ensures that the outbound request req
 // has the scheme set in its URL; the underlying
 // http.Transport requires a scheme to be set.
-func (h *HTTPTransport) SetScheme(req *http.Request) {
-	if req.URL.Scheme == "" {
+func (h *HTTPTransport) setScheme(req *http.Request) {
+	if req.URL.Scheme != "" {
+		return
+	}
+	if h.shouldUseTLS(req) {
+		req.URL.Scheme = "https"
+	} else {
 		req.URL.Scheme = "http"
-		if h.TLS != nil {
-			req.URL.Scheme = "https"
+	}
+}
+
+// shouldUseTLS returns true if TLS should be used for req.
+func (h *HTTPTransport) shouldUseTLS(req *http.Request) bool {
+	if h.TLS == nil {
+		return false
+	}
+
+	port := req.URL.Port()
+	for i := range h.TLS.ExceptPorts {
+		if h.TLS.ExceptPorts[i] == port {
+			return false
 		}
 	}
+
+	return true
 }
 
 // TLSEnabled returns true if TLS is enabled.
@@ -315,8 +370,30 @@ type TLSConfig struct {
 	// The duration to allow a TLS handshake to a server. Default: No timeout.
 	HandshakeTimeout caddy.Duration `json:"handshake_timeout,omitempty"`
 
-	// The server name (SNI) to use in TLS handshakes.
+	// The server name used when verifying the certificate received in the TLS
+	// handshake. By default, this will use the upstream address' host part.
+	// You only need to override this if your upstream address does not match the
+	// certificate the upstream is likely to use. For example if the upstream
+	// address is an IP address, then you would need to configure this to the
+	// hostname being served by the upstream server. Currently, this does not
+	// support placeholders because the TLS config is not provisioned on each
+	// connection, so a static value must be used.
 	ServerName string `json:"server_name,omitempty"`
+
+	// TLS renegotiation level. TLS renegotiation is the act of performing
+	// subsequent handshakes on a connection after the first.
+	// The level can be:
+	//  - "never": (the default) disables renegotiation.
+	//  - "once": allows a remote server to request renegotiation once per connection.
+	//  - "freely": allows a remote server to repeatedly request renegotiation.
+	Renegotiation string `json:"renegotiation,omitempty"`
+
+	// Skip TLS ports specifies a list of upstream ports on which TLS should not be
+	// attempted even if it is configured. Handy when using dynamic upstreams that
+	// return HTTP and HTTPS endpoints too.
+	// When specified, TLS will automatically be configured on the transport.
+	// The value can be a list of any valid tcp port numbers, default empty.
+	ExceptPorts []string `json:"except_ports,omitempty"`
 }
 
 // MakeTLSClientConfig returns a tls.Config usable by a client to a backend.
@@ -386,7 +463,19 @@ func (t TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
 		cfg.RootCAs = rootPool
 	}
 
-	// custom SNI
+	// Renegotiation
+	switch t.Renegotiation {
+	case "never", "":
+		cfg.Renegotiation = tls.RenegotiateNever
+	case "once":
+		cfg.Renegotiation = tls.RenegotiateOnceAsClient
+	case "freely":
+		cfg.Renegotiation = tls.RenegotiateFreelyAsClient
+	default:
+		return nil, fmt.Errorf("invalid TLS renegotiation level: %v", t.Renegotiation)
+	}
+
+	// override for the server name used verify the TLS handshake
 	cfg.ServerName = t.ServerName
 
 	// throw all security out the window
@@ -402,16 +491,16 @@ func (t TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
 
 // KeepAlive holds configuration pertaining to HTTP Keep-Alive.
 type KeepAlive struct {
-	// Whether HTTP Keep-Alive is enabled. Default: true
+	// Whether HTTP Keep-Alive is enabled. Default: `true`
 	Enabled *bool `json:"enabled,omitempty"`
 
 	// How often to probe for liveness. Default: `30s`.
 	ProbeInterval caddy.Duration `json:"probe_interval,omitempty"`
 
-	// Maximum number of idle connections. Default: 0, which means no limit.
+	// Maximum number of idle connections. Default: `0`, which means no limit.
 	MaxIdleConns int `json:"max_idle_conns,omitempty"`
 
-	// Maximum number of idle connections per host. Default: 32.
+	// Maximum number of idle connections per host. Default: `32`.
 	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host,omitempty"`
 
 	// How long connections should be kept alive when idle. Default: `2m`.

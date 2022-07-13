@@ -35,6 +35,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/rewrite"
 	"go.uber.org/zap"
 	"golang.org/x/net/http/httpguts"
 )
@@ -135,6 +136,18 @@ type Handler struct {
 	// If body buffering is enabled, the maximum size of the buffers
 	// used for the requests and responses (in bytes).
 	MaxBufferSize int64 `json:"max_buffer_size,omitempty"`
+
+	// If configured, rewrites the copy of the upstream request.
+	// Allows changing the request method and URI (path and query).
+	// Since the rewrite is applied to the copy, it does not persist
+	// past the reverse proxy handler.
+	// If the method is changed to `GET` or `HEAD`, the request body
+	// will not be copied to the backend. This allows a later request
+	// handler -- either in a `handle_response` route, or after -- to
+	// read the body.
+	// By default, no rewrite is performed, and the method and URI
+	// from the incoming request is used as-is for proxying.
+	Rewrite *rewrite.Rewrite `json:"rewrite,omitempty"`
 
 	// List of handlers and their associated matchers to evaluate
 	// after successful roundtrips. The first handler that matches
@@ -255,6 +268,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		err := h.Headers.Provision(ctx)
 		if err != nil {
 			return fmt.Errorf("provisioning embedded headers handler: %v", err)
+		}
+	}
+
+	if h.Rewrite != nil {
+		err := h.Rewrite.Provision(ctx)
+		if err != nil {
+			return fmt.Errorf("provisioning rewrite: %v", err)
 		}
 	}
 
@@ -385,7 +405,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	// prepare the request for proxying; this is needed only once
-	clonedReq, err := h.prepareRequest(r)
+	clonedReq, err := h.prepareRequest(r, repl)
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
 			fmt.Errorf("preparing request for upstream round-trip: %v", err))
@@ -412,7 +432,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	var proxyErr error
 	for {
 		var done bool
-		done, proxyErr = h.proxyLoopIteration(clonedReq, w, proxyErr, start, repl, reqHeader, reqHost, next)
+		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, repl, reqHeader, reqHost, next)
 		if done {
 			break
 		}
@@ -429,7 +449,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // that has to be passed in, we brought this into its own method so that we could run defer more easily.
 // It returns true when the loop is done and should break; false otherwise. The error value returned should
 // be assigned to the proxyErr value for the next iteration of the loop (or the error handled after break).
-func (h *Handler) proxyLoopIteration(r *http.Request, w http.ResponseWriter, proxyErr error, start time.Time,
+func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w http.ResponseWriter, proxyErr error, start time.Time,
 	repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler) (bool, error) {
 	// get the updated list of upstreams
 	upstreams := h.Upstreams
@@ -457,7 +477,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, w http.ResponseWriter, pro
 	upstream := h.LoadBalancing.SelectionPolicy.Select(upstreams, r, w)
 	if upstream == nil {
 		if proxyErr == nil {
-			proxyErr = fmt.Errorf("no upstreams available")
+			proxyErr = caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("no upstreams available"))
 		}
 		if !h.LoadBalancing.tryAgain(h.ctx, start, proxyErr, r) {
 			return true, proxyErr
@@ -503,8 +523,8 @@ func (h *Handler) proxyLoopIteration(r *http.Request, w http.ResponseWriter, pro
 	}
 
 	// proxy the request to that upstream
-	proxyErr = h.reverseProxy(w, r, repl, dialInfo, next)
-	if proxyErr == nil || proxyErr == context.Canceled {
+	proxyErr = h.reverseProxy(w, r, origReq, repl, dialInfo, next)
+	if proxyErr == nil || errors.Is(proxyErr, context.Canceled) {
 		// context.Canceled happens when the downstream client
 		// cancels the request, which is not our failure
 		return true, nil
@@ -536,8 +556,19 @@ func (h *Handler) proxyLoopIteration(r *http.Request, w http.ResponseWriter, pro
 // properties of the cloned request and should be done just once (before
 // proxying) regardless of proxy retries. This assumes that no mutations
 // of the cloned request are performed by h during or after proxying.
-func (h Handler) prepareRequest(req *http.Request) (*http.Request, error) {
+func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.Request, error) {
 	req = cloneRequest(req)
+
+	// if enabled, perform rewrites on the cloned request; if
+	// the method is GET or HEAD, prevent the request body
+	// from being copied to the upstream
+	if h.Rewrite != nil {
+		changed := h.Rewrite.Rewrite(req, repl)
+		if changed && (h.Rewrite.Method == "GET" || h.Rewrite.Method == "HEAD") {
+			req.ContentLength = 0
+			req.Body = nil
+		}
+	}
 
 	// if enabled, buffer client request; this should only be
 	// enabled if the upstream requires it and does not work
@@ -547,7 +578,7 @@ func (h Handler) prepareRequest(req *http.Request) (*http.Request, error) {
 	// attacks, so it is strongly recommended to only use this
 	// feature if absolutely required, if read timeouts are
 	// set, and if body size is limited
-	if h.BufferRequests {
+	if h.BufferRequests && req.Body != nil {
 		req.Body = h.bufferedBody(req.Body)
 	}
 
@@ -673,10 +704,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	// we pass through the request Host as-is, but in situations
 	// where we proxy over HTTPS, the user may need to override
 	// Host themselves, so it's helpful to send the original too.
-	host, _, err := net.SplitHostPort(req.Host)
-	if err != nil {
-		host = req.Host // OK; there probably was no port
-	}
+	host := req.Host
 	prior, ok, omit = lastHeaderValue(req.Header, "X-Forwarded-Host")
 	if trusted && ok && prior != "" {
 		host = prior
@@ -691,7 +719,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 // reverseProxy performs a round-trip to the given backend and processes the response with the client.
 // (This method is mostly the beginning of what was borrowed from the net/http/httputil package in the
 // Go standard library which was used as the foundation.)
-func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler) error {
+func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origReq *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler) error {
 	_ = di.Upstream.Host.countRequest(1)
 	//nolint:errcheck
 	defer di.Upstream.Host.countRequest(-1)
@@ -756,18 +784,14 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, repl *
 		res.Body = h.bufferedBody(res.Body)
 	}
 
-	// the response body may get closed by a response handler,
-	// and we need to keep track to make sure we don't try to copy
-	// the response if it was already closed
-	bodyClosed := false
-
 	// see if any response handler is configured for this response from the backend
 	for i, rh := range h.HandleResponse {
 		if rh.Match != nil && !rh.Match.Match(res.StatusCode, res.Header) {
 			continue
 		}
 
-		// if configured to only change the status code, do that then continue regular proxy response
+		// if configured to only change the status code,
+		// do that then continue regular proxy response
 		if statusCodeStr := rh.StatusCode.String(); statusCodeStr != "" {
 			statusCode, err := strconv.Atoi(repl.ReplaceAll(statusCodeStr, ""))
 			if err != nil {
@@ -798,45 +822,43 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, repl *
 		// we make some data available via request context to child routes
 		// so that they may inherit some options and functions from the
 		// handler, and be able to copy the response.
+		// we use the original request here, so that any routes from 'next'
+		// see the original request rather than the proxy cloned request.
 		hrc := &handleResponseContext{
 			handler:  h,
 			response: res,
 			start:    start,
 			logger:   logger,
 		}
-		ctx := req.Context()
+		ctx := origReq.Context()
 		ctx = context.WithValue(ctx, proxyHandleResponseContextCtxKey, hrc)
 
 		// pass the request through the response handler routes
-		routeErr := rh.Routes.Compile(next).ServeHTTP(rw, req.WithContext(ctx))
+		routeErr := rh.Routes.Compile(next).ServeHTTP(rw, origReq.WithContext(ctx))
 
-		// if the response handler routes already finalized the response,
-		// we can return early. It should be finalized if the routes executed
-		// included a copy_response handler. If a fresh response was written
-		// by the routes instead, then we still need to finalize the response
-		// without copying the body.
-		if routeErr == nil && hrc.isFinalized {
-			return nil
+		// close the response body afterwards, since we don't need it anymore;
+		// either a route had 'copy_response' which already consumed the body,
+		// or some other terminal handler ran which doesn't need the response
+		// body after that point (e.g. 'file_server' for X-Accel-Redirect flow),
+		// or we fell through to subsequent handlers past this proxy
+		// (e.g. forward auth's 2xx response flow).
+		if !hrc.isFinalized {
+			res.Body.Close()
 		}
 
-		// always close the response body afterwards, since it's expected
-		// that the response handler routes will have written to the
-		// response writer with a new body, if it wasn't already finalized.
-		res.Body.Close()
-		bodyClosed = true
-
+		// wrap any route error in roundtripSucceeded so caller knows that
+		// the roundtrip was successful and to not retry
 		if routeErr != nil {
-			// wrap error in roundtripSucceeded so caller knows that
-			// the roundtrip was successful and to not retry
 			return roundtripSucceeded{routeErr}
 		}
 
-		// we've already closed the body, so there's no use allowing
-		// another response handler to run as well
-		break
+		// we're done handling the response, and we don't want to
+		// fall through to the default finalize/copy behaviour
+		return nil
 	}
 
-	return h.finalizeResponse(rw, req, res, repl, start, logger, bodyClosed)
+	// copy the response body and headers back to the upstream client
+	return h.finalizeResponse(rw, req, res, repl, start, logger)
 }
 
 // finalizeResponse prepares and copies the response.
@@ -847,7 +869,6 @@ func (h Handler) finalizeResponse(
 	repl *caddy.Replacer,
 	start time.Time,
 	logger *zap.Logger,
-	bodyClosed bool,
 ) error {
 	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 	if res.StatusCode == http.StatusSwitchingProtocols {
@@ -859,13 +880,6 @@ func (h Handler) finalizeResponse(
 
 	for _, h := range hopHeaders {
 		res.Header.Del(h)
-	}
-
-	// remove the content length if we're not going to be copying
-	// from the response, because otherwise there'll be a mismatch
-	// between bytes written and the advertised length
-	if bodyClosed {
-		res.Header.Del("Content-Length")
 	}
 
 	// apply any response header operations
@@ -890,17 +904,16 @@ func (h Handler) finalizeResponse(
 	}
 
 	rw.WriteHeader(res.StatusCode)
-	if !bodyClosed {
-		err := h.copyResponse(rw, res.Body, h.flushInterval(req, res))
-		res.Body.Close() // close now, instead of defer, to populate res.Trailer
-		if err != nil {
-			// we're streaming the response and we've already written headers, so
-			// there's nothing an error handler can do to recover at this point;
-			// the standard lib's proxy panics at this point, but we'll just log
-			// the error and abort the stream here
-			h.logger.Error("aborting with incomplete response", zap.Error(err))
-			return nil
-		}
+
+	err := h.copyResponse(rw, res.Body, h.flushInterval(req, res))
+	res.Body.Close() // close now, instead of defer, to populate res.Trailer
+	if err != nil {
+		// we're streaming the response and we've already written headers, so
+		// there's nothing an error handler can do to recover at this point;
+		// the standard lib's proxy panics at this point, but we'll just log
+		// the error and abort the stream here
+		h.logger.Error("aborting with incomplete response", zap.Error(err))
+		return nil
 	}
 
 	if len(res.Trailer) > 0 {
@@ -1149,6 +1162,11 @@ func removeConnectionHeaders(h http.Header) {
 func statusError(err error) error {
 	// errors proxying usually mean there is a problem with the upstream(s)
 	statusCode := http.StatusBadGateway
+
+	// timeout errors have a standard status code (see issue #4823)
+	if err, ok := err.(net.Error); ok && err.Timeout() {
+		statusCode = http.StatusGatewayTimeout
+	}
 
 	// if the client canceled the request (usually this means they closed
 	// the connection, so they won't see any response), we can report it

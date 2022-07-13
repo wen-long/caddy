@@ -346,19 +346,17 @@ func (app *App) Start() error {
 					tlsCfg := srv.TLSConnPolicies.TLSConfig(app.ctx)
 					ln = tls.NewListener(ln, tlsCfg)
 
-					// create HTTP/3 listener
+					// create HTTP/3 server
 					app.logger.Info("enabling HTTP/3 listener", zap.String("addr", hostport))
 					h3ln, err := caddy.ListenQUIC(hostport, tlsCfg, &srv.activeRequests)
 					if err != nil {
 						return fmt.Errorf("starting HTTP/3 QUIC listener: %v", err)
 					}
 					h3srv := &http3.Server{
-						Server: &http.Server{
-							Addr:      hostport,
-							Handler:   srv,
-							TLSConfig: tlsCfg,
-							ErrorLog:  serverLogger,
-						},
+						Addr:           hostport,
+						Handler:        srv,
+						TLSConfig:      tlsCfg,
+						MaxHeaderBytes: srv.MaxHeaderBytes,
 					}
 					//nolint:errcheck
 					go h3srv.ServeListener(h3ln)
