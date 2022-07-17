@@ -345,7 +345,22 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 // Cleanup cleans up the resources made by h during provisioning.
 func (h *Handler) Cleanup() error {
-	// TODO: Close keepalive connections on reload? https://github.com/caddyserver/caddy/pull/2507/files#diff-70219fd88fe3f36834f474ce6537ed26R762
+	// close hijacked connections (both to client and backend)
+	var err error
+	h.connections.Range(func(key, value interface{}) bool {
+		oc := value.(openConnection)
+		if oc.gracefulClose != nil {
+			gracefulErr := oc.gracefulClose()
+			if gracefulErr != nil && err == nil {
+				err = gracefulErr
+			}
+		}
+		closeErr := oc.conn.Close()
+		if closeErr != nil && err == nil {
+			err = closeErr
+		}
+		return true
+	})
 
 	// remove hosts from our config from the pool
 	for _, upstream := range h.Upstreams {
