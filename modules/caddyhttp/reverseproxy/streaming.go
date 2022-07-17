@@ -204,6 +204,56 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, er
 	}
 }
 
+// registerConnection holds onto conn so it can be closed in the event
+// of a server shutdown. This is useful because hijacked connections or
+// connections dialed to backends don't close when server is shut down.
+// The caller should call the returned delete() function when the
+// connection is done to remove it from memory.
+func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (delete func()) {
+	h.connections.Store(conn, openConnection{conn, gracefulClose})
+	return func() {
+		h.connections.Delete(conn)
+	}
+}
+
+// writeCloseControl sends a best-effort Close control message to the given
+// WebSocket connection. Thanks to @pascaldekloe who provided inspiration
+// from his simple implementation of this I was able to learn from at:
+// github.com/pascaldekloe/websocket.
+func writeCloseControl(conn io.Writer) error {
+	// https://github.com/pascaldekloe/websocket/blob/32050af67a5d/websocket.go#L119
+
+	var reason string // max 123 bytes (control frame payload limit is 125; status code takes 2)
+	const goingAway uint16 = 1001
+
+	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
+	var writeBuf [127]byte
+	const closeMessage = 8
+	const finalBit = 1 << 7
+	writeBuf[0] = closeMessage | finalBit
+	writeBuf[1] = byte(len(reason) + 2)
+	binary.BigEndian.PutUint16(writeBuf[2:4], goingAway)
+	copy(writeBuf[4:], reason)
+
+	// simply best-effort, but return error for logging purposes
+	_, err := conn.Write(writeBuf[:4+len(reason)])
+	return err
+}
+
+// isWebsocket returns true if r looks to be an upgrade request for WebSockets.
+// It is a fairly naive check.
+func isWebsocket(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket")
+}
+
+// openConnection maps an open connection to
+// an optional function for graceful close.
+type openConnection struct {
+	conn          io.ReadWriteCloser
+	gracefulClose func() error
+}
+
 type writeFlusher interface {
 	io.Writer
 	http.Flusher
