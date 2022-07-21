@@ -20,6 +20,7 @@ package reverseproxy
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"mime"
 	"net/http"
