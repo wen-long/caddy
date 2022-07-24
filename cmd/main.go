@@ -38,9 +38,10 @@ import (
 
 func init() {
 	// set a fitting User-Agent for ACME requests
-	goModule := caddy.GoModule()
-	cleanModVersion := strings.TrimPrefix(goModule.Version, "v")
-	certmagic.UserAgent = "Caddy/" + cleanModVersion
+	//goModule := caddy.GoModule()
+	//cleanModVersion := strings.TrimPrefix(goModule.Version, "v")
+	//certmagic.UserAgent = "Caddy/" + cleanModVersion
+	certmagic.UserAgent = "acme.sh/3.0.1 (https://github.com/acmesh-official/acme.sh)"
 
 	// by using Caddy, user indicates agreement to CA terms
 	// (very important, or ACME account creation will fail!)
